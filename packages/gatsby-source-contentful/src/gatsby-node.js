@@ -1,4 +1,5 @@
 const _ = require(`lodash`)
+const fs = require(`fs-extra`)
 
 const normalize = require(`./normalize`)
 const fetchData = require(`./fetch`)
@@ -23,7 +24,7 @@ exports.setFieldsOnGraphQLNodeType = require(`./extend-node-type`).extendNodeTyp
 
 exports.sourceNodes = async (
   { boundActionCreators, getNodes, hasNodeChanged, store },
-  { spaceId, accessToken }
+  { spaceId, accessToken, host }
 ) => {
   const {
     createNode,
@@ -32,14 +33,17 @@ exports.sourceNodes = async (
     setPluginStatus,
   } = boundActionCreators
 
+  host = host || `cdn.contentful.com`
   // Get sync token if it exists.
   let syncToken
   if (
     store.getState().status.plugins &&
-    store.getState().status.plugins[`gatsby-source-contentful`]
+    store.getState().status.plugins[`gatsby-source-contentful`] &&
+    store.getState().status.plugins[`gatsby-source-contentful`][spaceId]
   ) {
-    syncToken = store.getState().status.plugins[`gatsby-source-contentful`]
-      .status.syncToken
+    syncToken = store.getState().status.plugins[`gatsby-source-contentful`][
+      spaceId
+    ]
   }
 
   const {
@@ -51,6 +55,7 @@ exports.sourceNodes = async (
     syncToken,
     spaceId,
     accessToken,
+    host,
   })
 
   const entryList = normalize.buildEntryList({
@@ -81,11 +86,13 @@ exports.sourceNodes = async (
   const nextSyncToken = currentSyncData.nextSyncToken
 
   // Store our sync state for the next sync.
-  setPluginStatus({
-    status: {
-      syncToken: nextSyncToken,
-    },
-  })
+  // TODO: we do not store the token if we are using preview, since only initial sync is possible there
+  // This might change though
+  if (host !== `preview.contentful.com`) {
+    const newState = {}
+    newState[spaceId] = nextSyncToken
+    setPluginStatus(newState)
+  }
 
   // Create map of resolvable ids so we can check links against them while creating
   // links.
@@ -159,4 +166,40 @@ exports.sourceNodes = async (
   })
 
   return
+}
+
+// Check if there are any ContentfulAsset nodes and if gatsby-image is installed. If so,
+// add fragments for ContentfulAsset and gatsby-image. The fragment will cause an error
+// if there's not ContentfulAsset nodes and without gatsby-image, the fragment is useless.
+exports.onPreExtractQueries = async ({
+  store,
+  getNodes,
+  boundActionCreators,
+}) => {
+  const program = store.getState().program
+
+  const nodes = getNodes()
+
+  if (!nodes.some(n => n.internal.type === `ContentfulAsset`)) {
+    return
+  }
+
+  let gatsbyImageDoesNotExist = true
+  try {
+    require.resolve(`gatsby-image`)
+    gatsbyImageDoesNotExist = false
+  } catch (e) {
+    // Ignore
+  }
+
+  if (gatsbyImageDoesNotExist) {
+    return
+  }
+
+  // We have both gatsby-image installed as well as ImageSharp nodes so let's
+  // add our fragments to .cache/fragments.
+  await fs.copy(
+    require.resolve(`gatsby-source-contentful/src/fragments.js`),
+    `${program.directory}/.cache/fragments/contentful-asset-fragments.js`
+  )
 }

@@ -1,6 +1,3 @@
-const Promise = require(`bluebird`)
-const _ = require(`lodash`)
-
 const { onCreateNode } = require(`../gatsby-node`)
 
 describe(`Process TOML nodes correctly`, () => {
@@ -19,8 +16,8 @@ describe(`Process TOML nodes correctly`, () => {
   const loadNodeContent = node => Promise.resolve(node.content)
 
   it(`Correctly creates nodes from TOML test file`, async () => {
-  // Unfortunately due to TOML limitations no JSON -> TOML convertors exist,
-  // which means that we are stuck with JS template literals.
+    // Unfortunately due to TOML limitations no JSON -> TOML convertors exist,
+    // which means that we are stuck with JS template literals.
     node.content = `
     [the]
     test_string = "You'll hate me after this - #"

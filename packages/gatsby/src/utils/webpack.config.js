@@ -2,11 +2,13 @@ import { uniq, some } from "lodash"
 import fs from "fs"
 import path from "path"
 import webpack from "webpack"
+import dotenv from "dotenv"
 import Config from "webpack-configurator"
 import ExtractTextPlugin from "extract-text-webpack-plugin"
 import StaticSiteGeneratorPlugin from "static-site-generator-webpack-plugin"
 import { StatsWriterPlugin } from "webpack-stats-plugin"
 import FriendlyErrorsWebpackPlugin from "friendly-errors-webpack-plugin"
+import { cssModulesConfig } from "gatsby-1-config-css-modules"
 
 // This isn't working right it seems.
 // import WebpackStableModuleIdAndHash from 'webpack-stable-module-id-and-hash'
@@ -16,9 +18,10 @@ const { store } = require(`../redux`)
 const debug = require(`debug`)(`gatsby:webpack-config`)
 const WebpackMD5Hash = require(`webpack-md5-hash`)
 const ChunkManifestPlugin = require(`chunk-manifest-webpack-plugin`)
-const GatsbyModulePlugin = require(`../loaders/gatsby-module-loader/plugin`)
+const GatsbyModulePlugin = require(`gatsby-module-loader/plugin`)
 const genBabelConfig = require(`./babel-config`)
-const { joinPath } = require(`./path`)
+const { withBasePath } = require(`./path`)
+const HashedChunkIdsPlugin = require(`./hashed-chunk-ids-plugin`)
 
 // Five stages or modes:
 //   1) develop: for `gatsby develop` command, hot reload and CSS injection into page
@@ -35,11 +38,45 @@ module.exports = async (
   pages = []
 ) => {
   const babelStage = suppliedStage
+  const directoryPath = withBasePath(directory)
 
   // We combine develop & develop-html stages for purposes of generating the
   // webpack config.
   const stage = suppliedStage
   const babelConfig = await genBabelConfig(program, babelStage)
+
+  function processEnv(stage, defaultNodeEnv) {
+    debug(`Building env for "${stage}"`)
+    const env = process.env.NODE_ENV
+      ? process.env.NODE_ENV
+      : `${defaultNodeEnv}`
+    const envFile = path.join(process.cwd(), `./.env.${env}`)
+    let parsed = {}
+    try {
+      parsed = dotenv.parse(fs.readFileSync(envFile, { encoding: `utf8` }))
+    } catch (e) {
+      if (e && e.code !== `ENOENT`) {
+        console.log(e)
+      }
+    }
+    const envObject = Object.keys(parsed).reduce((acc, key) => {
+      acc[key] = JSON.stringify(parsed[key])
+      return acc
+    }, {})
+
+    const gatsbyVarObject = Object.keys(process.env).reduce((acc, key) => {
+      if (key.match(/^GATSBY_/)) {
+        acc[key] = JSON.stringify(process.env[key])
+      }
+      return acc
+    }, {})
+
+    // Don't allow overwriting of NODE_ENV, PUBLIC_DIR as to not break gatsby things
+    envObject.NODE_ENV = JSON.stringify(env)
+    envObject.PUBLIC_DIR = JSON.stringify(`${process.cwd()}/public`)
+
+    return Object.assign(envObject, gatsbyVarObject)
+  }
 
   debug(`Loading webpack config for stage "${stage}"`)
   function output() {
@@ -54,7 +91,7 @@ module.exports = async (
         // Webpack will always generate a resultant javascript file.
         // But we don't want it for this step. Deleted by build-css.js.
         return {
-          path: joinPath(directory, `public`),
+          path: directoryPath(`public`),
           filename: `bundle-for-css.js`,
           publicPath: program.prefixPaths
             ? `${store.getState().config.pathPrefix}/`
@@ -65,7 +102,7 @@ module.exports = async (
         // A temp file required by static-site-generator-plugin. See plugins() below.
         // Deleted by build-html.js, since it's not needed for production.
         return {
-          path: joinPath(directory, `public`),
+          path: directoryPath(`public`),
           filename: `render-page.js`,
           libraryTarget: `umd`,
           publicPath: program.prefixPaths
@@ -76,7 +113,7 @@ module.exports = async (
         return {
           filename: `[name]-[chunkhash].js`,
           chunkFilename: `[name]-[chunkhash].js`,
-          path: joinPath(directory, `public`),
+          path: directoryPath(`public`),
           publicPath: program.prefixPaths
             ? `${store.getState().config.pathPrefix}/`
             : `/`,
@@ -95,24 +132,24 @@ module.exports = async (
             `${require.resolve(
               `webpack-hot-middleware/client`
             )}?path=http://${program.host}:${webpackPort}/__webpack_hmr&reload=true`,
-            joinPath(directory, `.cache/app`),
+            directoryPath(`.cache/app`),
           ],
         }
       case `develop-html`:
         return {
-          main: joinPath(directory, `.cache/develop-static-entry`),
+          main: directoryPath(`.cache/develop-static-entry`),
         }
       case `build-css`:
         return {
-          main: joinPath(directory, `.cache/app`),
+          main: directoryPath(`.cache/app`),
         }
       case `build-html`:
         return {
-          main: joinPath(directory, `.cache/static-entry`),
+          main: directoryPath(`.cache/static-entry`),
         }
       case `build-javascript`:
         return {
-          app: joinPath(directory, `.cache/production-app`),
+          app: directoryPath(`.cache/production-app`),
         }
       default:
         throw new Error(`The state requested ${stage} doesn't exist.`)
@@ -127,14 +164,10 @@ module.exports = async (
           new webpack.HotModuleReplacementPlugin(),
           new webpack.NoErrorsPlugin(),
           new webpack.DefinePlugin({
-            "process.env": {
-              NODE_ENV: JSON.stringify(
-                process.env.NODE_ENV ? process.env.NODE_ENV : `development`
-              ),
-              PUBLIC_DIR: JSON.stringify(`${process.cwd()}/public`),
-            },
+            "process.env": processEnv(stage, `development`),
             __PREFIX_PATHS__: program.prefixPaths,
             __PATH_PREFIX__: JSON.stringify(store.getState().config.pathPrefix),
+            __POLYFILL__: store.getState().config.polyfill,
           }),
           // Names module ids with their filepath. We use this in development
           // to make it easier to see what modules have hot reloaded, etc. as
@@ -142,6 +175,7 @@ module.exports = async (
           // ids to reduce filesize.
           new webpack.NamedModulesPlugin(),
           new FriendlyErrorsWebpackPlugin({
+            clearConsole: false,
             compilationSuccessInfo: {
               messages: [
                 `Your site is running at http://localhost:${program.port}`,
@@ -152,47 +186,41 @@ module.exports = async (
         ]
       case `develop-html`:
         return [
-          new StaticSiteGeneratorPlugin(`render-page.js`, pages),
+          new StaticSiteGeneratorPlugin({
+            entry: `render-page.js`,
+            paths: pages,
+          }),
           new webpack.DefinePlugin({
-            "process.env": {
-              NODE_ENV: JSON.stringify(
-                process.env.NODE_ENV ? process.env.NODE_ENV : `development`
-              ),
-              PUBLIC_DIR: JSON.stringify(`${process.cwd()}/public`),
-            },
+            "process.env": processEnv(stage, `development`),
             __PREFIX_PATHS__: program.prefixPaths,
             __PATH_PREFIX__: JSON.stringify(store.getState().config.pathPrefix),
+            __POLYFILL__: store.getState().config.polyfill,
           }),
           new ExtractTextPlugin(`build-html-styles.css`),
         ]
       case `build-css`:
         return [
           new webpack.DefinePlugin({
-            "process.env": {
-              NODE_ENV: JSON.stringify(
-                process.env.NODE_ENV ? process.env.NODE_ENV : `production`
-              ),
-              PUBLIC_DIR: JSON.stringify(`${process.cwd()}/public`),
-            },
+            "process.env": processEnv(stage, `production`),
             __PREFIX_PATHS__: program.prefixPaths,
             __PATH_PREFIX__: JSON.stringify(store.getState().config.pathPrefix),
+            __POLYFILL__: store.getState().config.polyfill,
           }),
           new ExtractTextPlugin(`styles.css`, { allChunks: true }),
         ]
       case `build-html`:
         return [
-          new StaticSiteGeneratorPlugin(`render-page.js`, pages),
+          new StaticSiteGeneratorPlugin({
+            entry: `render-page.js`,
+            paths: pages,
+          }),
           new webpack.DefinePlugin({
-            "process.env": {
-              NODE_ENV: JSON.stringify(
-                process.env.NODE_ENV ? process.env.NODE_ENV : `production`
-              ),
-              PUBLIC_DIR: JSON.stringify(`${process.cwd()}/public`),
-            },
+            "process.env": processEnv(stage, `production`),
             __PREFIX_PATHS__: program.prefixPaths,
             __PATH_PREFIX__: JSON.stringify(store.getState().config.pathPrefix),
+            __POLYFILL__: store.getState().config.polyfill,
           }),
-          new ExtractTextPlugin(`build-html-styles.css`),
+          new ExtractTextPlugin(`build-html-styles.css`, { allChunks: true }),
         ]
       case `build-javascript`: {
         // Get array of page template component names.
@@ -200,7 +228,6 @@ module.exports = async (
           .getState()
           .pages.map(page => page.componentChunkName)
         components = uniq(components)
-        components.push(`layout-component---index`)
         return [
           // Moment.js includes 100s of KBs of extra localization data by
           // default in Webpack that most sites don't want. This line disables
@@ -232,8 +259,8 @@ module.exports = async (
                 `fbjs`,
                 `react-router`,
                 `react-router-dom`,
-                `react-router-scroll`,
-                `dom-helpers`, // Used in react-router-scroll
+                `gatsby-react-router-scroll`,
+                `dom-helpers`, // Used in gatsby-react-router-scroll
                 `path-to-regexp`,
                 `isarray`, // Used by path-to-regexp.
                 `scroll-behavior`,
@@ -250,7 +277,7 @@ module.exports = async (
               ]
               const isFramework = some(
                 vendorModuleList.map(vendor => {
-                  const regex = new RegExp(`\/node_modules\/${vendor}\/.*`, `i`)
+                  const regex = new RegExp(`/node_modules/${vendor}/.*`, `i`)
                   return regex.test(module.resource)
                 })
               )
@@ -261,17 +288,13 @@ module.exports = async (
           // optimizations for React) and whether prefixing links is enabled
           // (__PREFIX_PATHS__) and what the link prefix is (__PATH_PREFIX__).
           new webpack.DefinePlugin({
-            "process.env": {
-              NODE_ENV: JSON.stringify(
-                process.env.NODE_ENV ? process.env.NODE_ENV : `production`
-              ),
-              PUBLIC_DIR: JSON.stringify(`${process.cwd()}/public`),
-            },
+            "process.env": processEnv(stage, `production`),
             __PREFIX_PATHS__: program.prefixPaths,
             __PATH_PREFIX__: JSON.stringify(store.getState().config.pathPrefix),
+            __POLYFILL__: store.getState().config.polyfill,
           }),
           // Extract CSS so it doesn't get added to JS bundles.
-          new ExtractTextPlugin(`build-js-styles.css`),
+          new ExtractTextPlugin(`build-js-styles.css`, { allChunks: true }),
           // Write out mapping between chunk names and their hashed names. We use
           // this to add the needed javascript files to each HTML page.
           new StatsWriterPlugin(),
@@ -300,7 +323,7 @@ module.exports = async (
           new webpack.optimize.OccurenceOrderPlugin(),
           new GatsbyModulePlugin(),
           // new WebpackStableModuleIdAndHash({ seed: 9, hashSize: 47 }),
-          new webpack.NamedModulesPlugin(),
+          new HashedChunkIdsPlugin(),
         ]
       }
       default:
@@ -319,9 +342,9 @@ module.exports = async (
       // directory if you need to install a specific version of a module for a
       // part of your site.
       modulesDirectories: [
-        joinPath(directory, `node_modules`),
         `node_modules`,
-        joinPath(directory, `node_modules`, `gatsby`, `node_modules`),
+        directoryPath(`node_modules`),
+        directoryPath(`node_modules`, `gatsby`, `node_modules`),
       ],
     }
   }
@@ -330,9 +353,10 @@ module.exports = async (
     switch (stage) {
       case `develop`:
         return `cheap-module-source-map`
-      case `build-html`:
+      // use a normal `source-map` for the html phases since
+      // it gives better line and column numbers
       case `develop-html`:
-        return false
+      case `build-html`:
       case `build-javascript`:
         return `source-map`
       default:
@@ -360,7 +384,7 @@ module.exports = async (
     // "file" loader makes sure those assets end up in the `public` folder.
     // When you `import` an asset, you get its filename.
     config.loader(`file-loader`, {
-      test: /\.(ico|eot|otf|webp|ttf|woff(2)?)(\?.*)?$/,
+      test: /\.(ico|eot|otf|webp|pdf|ttf|woff(2)?)(\?.*)?$/,
       loader: `file`,
       query: {
         name: `static/[name].[hash:8].[ext]`,
@@ -377,9 +401,6 @@ module.exports = async (
       },
     })
 
-    const cssModulesConf = `css?modules&minimize&importLoaders=1`
-    const cssModulesConfDev = `${cssModulesConf}&sourceMap&localIdentName=[name]---[local]---[hash:base64:5]`
-
     switch (stage) {
       case `develop`:
         config.loader(`css`, {
@@ -391,7 +412,7 @@ module.exports = async (
         // CSS modules
         config.loader(`cssModules`, {
           test: /\.module\.css$/,
-          loaders: [`style`, cssModulesConfDev, `postcss`],
+          loaders: [`style`, cssModulesConfig(stage), `postcss`],
         })
 
         config.merge({
@@ -417,7 +438,7 @@ module.exports = async (
         config.loader(`cssModules`, {
           test: /\.module\.css$/,
           loader: ExtractTextPlugin.extract(`style`, [
-            cssModulesConf,
+            cssModulesConfig(stage),
             `postcss`,
           ]),
         })
@@ -447,7 +468,7 @@ module.exports = async (
         config.loader(`cssModules`, {
           test: /\.module\.css$/,
           loader: ExtractTextPlugin.extract(`style`, [
-            cssModulesConf,
+            cssModulesConfig(stage),
             `postcss`,
           ]),
         })
@@ -473,7 +494,7 @@ module.exports = async (
         config.loader(`cssModules`, {
           test: /\.module\.css$/,
           loader: ExtractTextPlugin.extract(`style`, [
-            cssModulesConf,
+            cssModulesConfig(stage),
             `postcss`,
           ]),
         })
@@ -520,7 +541,7 @@ module.exports = async (
     // and server (see
     // https://github.com/defunctzombie/package-browser-field-spec); setting
     // the target tells webpack which file to include, ie. browser vs main.
-    target: stage === (`build-html` || `develop-html`) ? `node` : `web`,
+    target: stage === `build-html` || stage === `develop-html` ? `node` : `web`,
     profile: stage === `production`,
     devtool: devtool(),
     output: output(),

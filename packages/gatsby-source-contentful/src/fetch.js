@@ -3,7 +3,7 @@ const _ = require(`lodash`)
 
 const normalize = require(`./normalize`)
 
-module.exports = async ({ spaceId, accessToken, syncToken }) => {
+module.exports = async ({ spaceId, accessToken, host, syncToken }) => {
   // Fetch articles.
   console.time(`Fetch Contentful data`)
   console.log(`Starting to fetch data from Contentful`)
@@ -11,6 +11,7 @@ module.exports = async ({ spaceId, accessToken, syncToken }) => {
   const client = contentful.createClient({
     space: spaceId,
     accessToken,
+    host: host || `cdn.contentful.com`,
   })
 
   // The sync API puts the locale in all fields in this format { fieldName:
@@ -62,21 +63,25 @@ module.exports = async ({ spaceId, accessToken, syncToken }) => {
     if (e) {
       return normalize.fixIds(e)
     }
+    return null
   })
   currentSyncData.assets = currentSyncData.assets.map(a => {
     if (a) {
       return normalize.fixIds(a)
     }
+    return null
   })
   currentSyncData.deletedEntries = currentSyncData.deletedEntries.map(e => {
     if (e) {
       return normalize.fixIds(e)
     }
+    return null
   })
   currentSyncData.deletedAssets = currentSyncData.deletedAssets.map(a => {
     if (a) {
       return normalize.fixIds(a)
     }
+    return null
   })
 
   return {
@@ -100,24 +105,20 @@ function pagedGet(
   pageLimit = 1000,
   aggregatedResponse = null
 ) {
-  return client
-    [method]({
-      ...query,
-      skip: skip,
-      limit: pageLimit,
-      order: `sys.createdAt`,
-    })
-    .then(response => {
-      if (!aggregatedResponse) {
-        aggregatedResponse = response
-      } else {
-        aggregatedResponse.items = aggregatedResponse.items.concat(
-          response.items
-        )
-      }
-      if (skip + pageLimit <= response.total) {
-        return pagedGet(client, method, skip + pageLimit, aggregatedResponse)
-      }
-      return aggregatedResponse
-    })
+  return client[method]({
+    ...query,
+    skip: skip,
+    limit: pageLimit,
+    order: `sys.createdAt`,
+  }).then(response => {
+    if (!aggregatedResponse) {
+      aggregatedResponse = response
+    } else {
+      aggregatedResponse.items = aggregatedResponse.items.concat(response.items)
+    }
+    if (skip + pageLimit <= response.total) {
+      return pagedGet(client, method, skip + pageLimit, aggregatedResponse)
+    }
+    return aggregatedResponse
+  })
 }
